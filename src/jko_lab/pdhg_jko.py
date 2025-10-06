@@ -257,7 +257,7 @@ def _choose_stepsizes(n: int) -> Tuple[float, float]:
     t = 0.9 / (K + 1e-12)
     return t, t
 
-
+@flstr.dataclass
 class PrimalDualJKO:
     C: Array # (n, n) squared-distance matrix
     rho0: Array # (n,) given probability vector (nonnegative, sums to 1)
@@ -273,7 +273,7 @@ class PrimalDualJKO:
 
     # ----------------- one JKO step via PDHG -----------------
 
-    @partial(jax.jit, static_argnames=("self",))
+    @jax.jit
     def take_step(self, rho_k: Array,
                   pi_ws: Optional[Array] = None,
                   u_ws: Optional[Array] = None,
@@ -293,7 +293,7 @@ class PrimalDualJKO:
             (tau is None) | (sigma is None),
             lambda _: _choose_stepsizes(n),
             lambda _: (float(tau), float(sigma)),
-            operand=None,
+            operand=None
         )
 
         # Initial state
@@ -332,7 +332,8 @@ class PrimalDualJKO:
         return rho_next, pi_f, u_f, v_f
 
     # ----------------- full JKO flow (fully JIT) -----------------
-    @partial(jax.jit, static_argnames=("self",))
+
+    @jax.jit
     def compute_flow(self) -> Tuple[Array, Array]:
         """
         Run num_iters JKO steps starting from self.rho0 with warm-starts.
