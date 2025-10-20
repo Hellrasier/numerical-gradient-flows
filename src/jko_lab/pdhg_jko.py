@@ -98,7 +98,7 @@ def proxF_entropy(z: Array, alpha: float, eps: float = 0.0) -> Array:
 
 def _K_apply(pi: Array) -> Tuple[Array, Array]:
     """K(pi) = (rho, nu) = (row_sums(pi), col_sums(pi))."""
-    return row_sums(pi), col_sums(pi)
+    return _row_sums(pi), _col_sums(pi)
 
 
 def _KT_apply(rho: Array, nu: Array) -> Array:
@@ -149,6 +149,7 @@ class PrimalDualJKO:
     C: Array # (n, n) squared-distance matrix
     rho0: Array # (n,) given probability vector (nonnegative, sums to 1)
     eta: float # positive JKO step coefficient
+    reg: float
 
     # Static/non-traced fields (config, Python callables, etc.)
     proxF: Callable[[Array, float], Array] | Callable[..., Array] = flstr.field(pytree_node=False) # Proximal of the functional
@@ -163,6 +164,7 @@ class PrimalDualJKO:
     def take_step(self, rho_k: Array,
                   tau: float,
                   sigma: float,
+                  reg: float,
                   pi_ws: Optional[Array] = None,
                   u_ws: Optional[Array] = None,
                   v_ws: Optional[Array] = None) -> Tuple[Array, Array, Array, Array]:
@@ -185,7 +187,7 @@ class PrimalDualJKO:
 
             # Primal (pi)
             term = 0.5 * C + u_c[:, None] + v_c[None, :]
-            pi_new = jnp.maximum(pi_c - tau * term, 0.0)
+            pi_new = jnp.maximum((pi_c - tau * term)/(1 + tau*reg), 0.0)
 
             # Primal (rho) via prox of eta * F
             rho_new = self.proxF(rho_c + tau * u_c, self.eta * tau)
@@ -226,7 +228,7 @@ class PrimalDualJKO:
 
         def one_step(carry, _):
             rho_k, pi_ws, u_ws, v_ws = carry
-            rho_next, pi_f, u_f, v_f = self.take_step(rho_k, tau, sigma, pi_ws, u_ws, v_ws)
+            rho_next, pi_f, u_f, v_f = self.take_step(rho_k, tau, sigma, self.reg, pi_ws, u_ws, v_ws)
             col_resid = jnp.linalg.norm(_col_sums(pi_f) - rho_k, ord=2)
             next_carry = (rho_next, pi_f, u_f, v_f)
             out = (rho_next, col_resid)
