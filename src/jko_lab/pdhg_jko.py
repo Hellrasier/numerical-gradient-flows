@@ -43,7 +43,7 @@ import flax.struct as flstr
 import jax
 import jax.numpy as jnp
 from jax import lax
-from lambert import lambertw
+from .lambert import lambertw
 
 Array = jnp.ndarray
 
@@ -265,7 +265,7 @@ class PrimalDualJKO:
 
     # Static/non-traced fields (config, Python callables, etc.)
     proxF: Callable[[Array, float], Array] | Callable[..., Array] = flstr.field(pytree_node=False) # Proximal of the functional
-    proxF_kwargs: Optional[Dict[str, Any]] = flstr.field(pytree_node=False, defaul=None) # Arguments of the proximal
+    proxF_kwargs: Optional[Dict[str, Any]] = flstr.field(pytree_node=False, default=None) # Arguments of the proximal
     tau: Optional[float] = flstr.field(pytree_node=False, default=None),
     sigma: Optional[float] = flstr.field(pytree_node=False, default=None),
     num_iters: int = flstr.field(pytree_node=False, default=20)  # outer steps (JKO steps)
