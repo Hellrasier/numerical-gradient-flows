@@ -10,3 +10,4 @@ __pycache__/
 .venv
 .idea
 test.py
+old_sinkhorn_jko_test.ipynb
