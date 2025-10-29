@@ -1,234 +1,288 @@
 """
-Sinkhorn algorithm for entropy-regularized optimal transport in JAX.
+Sinkhorn algorithm for entropy-regularized optimal transport
 
-Problem (discrete):
-    min_{pi >= 0}  <C, pi> + epsilon * H(pi)
-    subject to: pi @ 1 = a,  pi^T @ 1 = b
+Upon discretization, entropy regularized optimal transport solves the following problem:
+    min_{pi >= 0} <C, pi> + epsilon * H(pi)
+    such that pi @ 1 = a, and pi.T @ 1 = b
 
-where H(pi) = sum_{i,j} pi_{ij} * (log(pi_{ij}) - 1) is the Shannon entropy.
-
-We also provide extensions for:
-- Multi-marginal optimal transport (N marginals)
-- JKO steps with entropy regularization
+where H(pi) = sum_{i,j} pi_{i,j} (log(pi_{i,j}) - 1) is the Shannon entropy of pi.
 """
+
 from __future__ import annotations
-
-from typing import Callable, Optional, Tuple, List
+from typing import Callable, Optional, Tuple
 import flax.struct as flstr
-
 import jax
 import jax.numpy as jnp
 from jax import lax
-
+from jax.scipy.special import logsumexp
 Array = jnp.ndarray
 
-
-def _compute_kernel(C: Array, epsilon: float) -> Array:
-    """Compute Gibbs kernel K = exp(-C/epsilon)."""
-    return jnp.exp(-C / epsilon)
-
-
-def _row_sums(pi: Array) -> Array:
-    """Compute row sums of a matrix."""
-    return pi.sum(axis=1)
-
-
-def _col_sums(pi: Array) -> Array:
-    """Compute column sums of a matrix."""
-    return pi.sum(axis=0)
-
-
-def _compute_coupling(u: Array, v: Array, K: Array) -> Array:
-    """Compute coupling pi from dual variables: pi = diag(u) @ K @ diag(v)."""
-    return u[:, None] * K * v[None, :]
-
-
-def _marginal_error(pi: Array, a: Array, b: Array) -> float:
-    """Compute maximum marginal constraint violation."""
-    error_a = jnp.abs(_row_sums(pi) - a).sum()
-    error_b = jnp.abs(_col_sums(pi) - b).sum()
-    return jnp.maximum(error_a, error_b)
-
-
-# -------------------- Sinkhorn Algorithm --------------------
-
-@flstr.dataclass
-class Sinkhorn:
+def _sinkhorn_log_step(f: Array, g: Array, C: Array, a: Array, b: Array, 
+                       epsilon: float) -> Tuple[Array, Array]:
     """
-    Sinkhorn algorithm for entropy-regularized optimal transport between two marginals.
+    Take a single step of log-sum-exp version of Sinkhorn iterations. The updates are given by:
+
+        f = ε·log(a) - ε·logsumexp((g_j - C_ij)/ε, over j)
+        g = ε·log(b) - ε·logsumexp((f_i - C_ij)/ε, over i)
     
-    Solves:
-        min_{pi >= 0}  <C, pi> - epsilon * H(pi)
-        s.t.  pi @ 1 = a,  pi^T @ 1 = b
-    
-    Attributes:
+    Args:
+        f: Log-potential for rows (n,)
+        g: Log-potential for columns (m,)
         C: Cost matrix (n, m)
         a: Source marginal (n,)
         b: Target marginal (m,)
         epsilon: Regularization parameter
-        max_iters: Maximum number of Sinkhorn iterations
+        
+    Returns:
+        f_new: Updated log-potential for rows (n,)
+        g_new: Updated log-potential for columns (m,)
+    """
+    f_new = epsilon * jnp.log(a) - epsilon * logsumexp(
+        (g[None, :] - C) / epsilon, axis=1
+    )
+    g_new = epsilon * jnp.log(b) - epsilon * logsumexp(
+        (f_new[:, None] - C) / epsilon, axis=0
+    )
+    
+    return f_new, g_new
+
+
+def _compute_coupling_from_log(f: Array, g: Array, C: Array, epsilon: float) -> Array:
+    """
+    Recover the optimal transport coupling π from log-potentials f and g using:
+
+        π_ij = u_i * K_ij * v_j
+             = exp(log(u_i) + log(K_ij) + log(v_j))
+             = exp((f_i + g_j - C_ij) / ε)
+    
+    where f = ε·log(u), g = ε·log(v), and K = exp(-C/ε).
+    
+    Args:
+        f: Log-potential for rows (n,)
+        g: Log-potential for columns (m,)
+        C: Cost matrix (n, m)
+        epsilon: Regularization parameter
+        
+    Returns:
+        pi: Transport coupling (n, m) - satisfies π≥0, row sums=a, col sums=b
+    """
+    return jnp.exp((f[:, None] + g[None, :] - C) / epsilon)
+
+
+def _row_sums(pi: Array) -> Array:
+    """Compute row sums of coupling matrix: π @ 1."""
+    return pi.sum(axis=1)
+
+
+def _col_sums(pi: Array) -> Array:
+    """Compute column sums of coupling matrix: π.T @ 1."""
+    return pi.sum(axis=0)
+
+
+def _marginal_error(pi: Array, a: Array, b: Array) -> float:
+    """
+    Compute maximum of errors on marginals.
+    
+    Args:
+        pi: Transport coupling (n, m)
+        a: Source marginal (n,)
+        b: Target marginal (m,)
+        
+    Returns:
+        error: max(||π@1 - a||_∞, ||π.T@1 - b||_∞)
+    """
+    error_a = jnp.abs(_row_sums(pi) - a).max()
+    error_b = jnp.abs(_col_sums(pi) - b).max()
+    return jnp.maximum(error_a, error_b)
+
+
+@flstr.dataclass
+class Sinkhorn:
+    """
+    Log-sum-exp formulation of Sinkhorn solver for entropy-regularized optimal transport.
+    
+    Solves the discrete OT problem:
+        min_{π≥0}  ⟨C, π⟩ + ε·H(π)
+        subject to: π @ 1 = a,  π.T @ 1 = b
+    
+    where H(π) = Σᵢⱼ πᵢⱼ(log(πᵢⱼ) - 1) is Shannon entropy.
+
+    Attributes:
+        C: Cost matrix (n, m) - typically squared Euclidean distances
+        a: Source marginal (n,) - probability vector (positive, sums to 1)
+        b: Target marginal (m,) - probability vector (positive, sums to 1)
+        epsilon: Regularization parameter - smaller values approximate true W₂
+        max_iters: Maximum number of iterations
         tol: Convergence tolerance for marginal constraints
     """
-    C: Array  # (n, m)
-    a: Array  # (n,)
-    b: Array  # (m,)
-    epsilon: float
+    C: Array  # (n, m) cost matrix
+    a: Array  # (n,) source marginal
+    b: Array  # (m,) target marginal
+    epsilon: float  # entropic regularization
     max_iters: int = flstr.field(pytree_node=False, default=1000)
     tol: float = flstr.field(pytree_node=False, default=1e-9)
 
-    def __post_init__(self):
-        """Precompute the Gibbs kernel."""
-        object.__setattr__(self, '_K', _compute_kernel(self.C, self.epsilon))
-
     @jax.jit
     def solve(self, 
-              u_init: Optional[Array] = None,
-              v_init: Optional[Array] = None) -> Tuple[Array, Array, Array, float, int]:
+              f_init: Optional[Array] = None,
+              g_init: Optional[Array] = None) -> Tuple[Array, Array, Array, float, int]:
         """
-        Solve the entropy-regularized OT problem.
+        Solve entropy-regularized OT using log-domain Sinkhorn iterations.
         
         Args:
-            u_init: Initial dual variable (n,), default ones
-            v_init: Initial dual variable (m,), default ones
+            f_init: Initial log-potential for rows (n,). If None, starts with zeros.
+            g_init: Initial log-potential for cols (m,). If None, starts with zeros.
             
         Returns:
-            pi: Optimal coupling (n, m)
-            u: Final dual variable (n,)
-            v: Final dual variable (m,)
+            pi: Optimal transport coupling (n, m)
+            f: Final log-potential for rows (n,)
+            g: Final log-potential for columns (m,)
             error: Final marginal constraint violation
-            iterations: Number of iterations performed
+            iters: Number of iterations performed
         """
         n, m = self.C.shape
-        K = self._K
         
-        # Initialize dual variables
-        u = jnp.ones(n) if u_init is None else u_init
-        v = jnp.ones(m) if v_init is None else v_init
+        # Initialize log-potentials
+        f = jnp.zeros(n) if f_init is None else f_init
+        g = jnp.zeros(m) if g_init is None else g_init
 
         def body_fn(carry):
-            u_c, v_c, _, _ = carry
+            """Single iteration: update f, g and check error."""
+            f_c, g_c, _, iteration = carry
             
-            # Sinkhorn update
-            u_new = self.a / (K @ v_c + 1e-300)
-            v_new = self.b / (K.T @ u_new + 1e-300)
+            # Perform one log-domain Sinkhorn step
+            f_new, g_new = _sinkhorn_log_step(
+                f_c, g_c, self.C, self.a, self.b, self.epsilon
+            )
             
-            # Compute error
-            pi = _compute_coupling(u_new, v_new, K)
+            # Compute marginal error
+            pi = _compute_coupling_from_log(f_new, g_new, self.C, self.epsilon)
             error = _marginal_error(pi, self.a, self.b)
             
-            return (u_new, v_new, error, 1)
+            return (f_new, g_new, error, iteration + 1)
 
         def cond_fn(carry):
+            """Continue while error > tol and not exceeded max_iters."""
             _, _, error, iteration = carry
             return (error > self.tol) & (iteration < self.max_iters)
 
-        # Run Sinkhorn iterations
-        init_carry = (u, v, jnp.inf, 0)
-        u_final, v_final, error_final, iters = lax.while_loop(
+        # Run Sinkhorn iterations with early stopping
+        init_carry = (f, g, jnp.inf, 0)
+        f_final, g_final, error_final, iters = lax.while_loop(
             cond_fn, body_fn, init_carry
         )
         
-        # Compute final coupling
-        pi_final = _compute_coupling(u_final, v_final, K)
+        # Compute final coupling from converged log-potentials
+        pi_final = _compute_coupling_from_log(f_final, g_final, self.C, self.epsilon)
         
-        return pi_final, u_final, v_final, error_final, iters
+        return pi_final, f_final, g_final, error_final, iters
 
     @jax.jit
     def solve_fixed_iters(self,
                           num_iters: int,
-                          u_init: Optional[Array] = None,
-                          v_init: Optional[Array] = None) -> Tuple[Array, Array, Array, float]:
+                          f_init: Optional[Array] = None,
+                          g_init: Optional[Array] = None) -> Tuple[Array, Array, Array, float]:
         """
-        Solve with a fixed number of iterations (useful for JIT compilation).
+        Solve with exactly num_iters iterations
         
         Args:
-            num_iters: Number of Sinkhorn iterations to perform
-            u_init: Initial dual variable (n,)
-            v_init: Initial dual variable (m,)
+            num_iters: Exact number of iterations to perform
+            f_init: Initial log-potential for rows (n,), default zeros
+            g_init: Initial log-potential for columns (m,), default zeros
             
         Returns:
-            pi: Coupling (n, m)
-            u: Final dual variable (n,)
-            v: Final dual variable (m,)
+            pi: Transport coupling (n, m)
+            f: Final log-potential for rows (n,)
+            g: Final log-potential for columns (m,)
             error: Final marginal constraint violation
+            
+        Note:
+            Unlike solve(), this method does NOT return iteration count
+            since it always performs exactly num_iters iterations.
         """
         n, m = self.C.shape
-        K = self._K
         
-        u = jnp.ones(n) if u_init is None else u_init
-        v = jnp.ones(m) if v_init is None else v_init
+        # Initialize log-potentials
+        f = jnp.zeros(n) if f_init is None else f_init
+        g = jnp.zeros(m) if g_init is None else g_init
 
         def body_fn(_, carry):
-            u_c, v_c = carry
-            u_new = self.a / (K @ v_c + 1e-300)
-            v_new = self.b / (K.T @ u_new + 1e-300)
-            return (u_new, v_new)
+            """Single iteration: just update f and g."""
+            f_c, g_c = carry
+            f_new, g_new = _sinkhorn_log_step(
+                f_c, g_c, self.C, self.a, self.b, self.epsilon
+            )
+            return (f_new, g_new)
 
-        u_final, v_final = lax.fori_loop(0, num_iters, body_fn, (u, v))
-        pi_final = _compute_coupling(u_final, v_final, K)
+        # Run fixed number of iterations
+        f_final, g_final = lax.fori_loop(0, num_iters, body_fn, (f, g))
+        
+        # Compute final coupling and error
+        pi_final = _compute_coupling_from_log(f_final, g_final, self.C, self.epsilon)
         error = _marginal_error(pi_final, self.a, self.b)
         
-        return pi_final, u_final, v_final, error
+        return pi_final, f_final, g_final, error
 
-
-# -------------------- Sinkhorn for JKO steps --------------------
 
 @flstr.dataclass
 class SinkhornJKO:
     """
-    JKO scheme using entropy-regularized optimal transport.
+    JKO (Jordan-Kinderlehrer-Otto) scheme using entropy-regularized OT.
     
-    For a functional F and initial distribution rho_0, computes the Wasserstein gradient flow
-    by iteratively solving:
-        rho_{k+1} = argmin_{rho} eta * F(rho) + W_epsilon(rho, rho_k)
+    Computes discrete-time Wasserstein gradient flow for a functional F:
+        rho_{k+1} = argmin_rho { F(rho) + (1/2*tau)W₂²(rho, rho_k) }
     
-    where W_epsilon is the Shannon-entropy regularized 2-Wasserstein distance.
-    
-    For simple functionals (e.g., internal energy), this reduces to a modified
-    Sinkhorn algorithm with adjusted marginals.
+    where W₂ is approximated by Sinkhorn with regularization ε.
     
     Attributes:
-        C: Cost matrix (n, n)
-        rho0: Initial distribution (n,)
-        eta: JKO time step
-        epsilon: Entropy regularization parameter
-        F_func: Functional F (optional, for general case)
-        inner_steps: Number of Sinkhorn iterations per JKO step
+        C: Cost matrix (n, n) - squared distances on domain
+        rho0: Initial distribution (n,) - starting condition
+        eta: JKO timestep - controls temporal discretization
+        epsilon: Sinkhorn regularization - controls W₂ approximation quality
+        F_func: Optional functional F to minimize (not yet implemented)
+        inner_steps: Max Sinkhorn iterations per JKO step
+        tol: Convergence tolerance for inner Sinkhorn solves
     """
-    C: Array  # (n, n)
-    rho0: Array  # (n,)
-    eta: float
-    epsilon: float
-    F_func: Optional[Callable[[Array], float]] = flstr.field(pytree_node=False, default=None)
+    C: Array  # (n, n) cost matrix
+    rho0: Array  # (n,) initial distribution
+    eta: float  # JKO timestep
+    epsilon: float  # Sinkhorn regularization
+    F_func: Optional[Callable[[Array], float]] = flstr.field(
+        pytree_node=False, default=None
+    )
     inner_steps: int = flstr.field(pytree_node=False, default=1000)
     tol: float = flstr.field(pytree_node=False, default=1e-9)
 
     @jax.jit
     def take_step(self,
                   rho_k: Array,
-                  u_ws: Optional[Array] = None,
-                  v_ws: Optional[Array] = None) -> Tuple[Array, Array, Array, float]:
+                  f_ws: Optional[Array] = None,
+                  g_ws: Optional[Array] = None) -> Tuple[Array, Array, Array, float]:
         """
-        Take a single JKO step from rho_k.
+        Take a single JKO step: ρ_{k+1} from ρ_k.
         
-        For the special case of internal energy F(rho) = sum rho_i * V_i,
-        the JKO step becomes a Sinkhorn problem with modified cost.
+        For the basic case (F=0), this solves:
+            min_ρ W²_ε(ρ, ρ_k)  s.t. Σρ = 1, ρ ≥ 0
+        
+        which is equivalent to Sinkhorn OT from ρ_k to ρ_k (identity mapping).
         
         Args:
             rho_k: Current distribution (n,)
-            u_ws: Warm-start for u (n,)
-            v_ws: Warm-start for v (n,)
+            f_ws: Warm-start log-potential for rows (n,), optional
+            g_ws: Warm-start log-potential for columns (n,), optional
             
         Returns:
-            rho_next: Next distribution (n,)
-            u: Final dual variable (n,)
-            v: Final dual variable (n,)
-            error: Convergence error
+            rho_next: Next distribution (n,) - normalized to sum to 1
+            f: Final log-potential from Sinkhorn solve
+            g: Final log-potential from Sinkhorn solve
+            error: Sinkhorn convergence error
+            
+        Note:
+            The warm-start potentials f_ws, g_ws from previous JKO step
+            significantly reduce the number of Sinkhorn iterations needed.
         """
-        # For simplicity, we solve: min W_epsilon(rho, rho_k)
-        # subject to rho >= 0, sum(rho) = 1
-        # This is equivalent to Sinkhorn with a = rho, b = rho_k
-        
+        # Create Sinkhorn solver for this JKO step
+        # Note: Using rho_k for both source and target in simple case
         solver = Sinkhorn(
             C=self.C,
             a=rho_k,
@@ -238,40 +292,66 @@ class SinkhornJKO:
             tol=self.tol
         )
         
-        pi, u, v, error, _ = solver.solve(u_init=u_ws, v_init=v_ws)
+        # Solve inner OT problem
+        pi, f, g, error, _ = solver.solve(f_init=f_ws, g_init=g_ws)
         
-        # Extract marginal and normalize
+        # Extract next distribution as row marginal
         rho_next = _row_sums(pi)
+        
+        # Normalize to ensure exact mass conservation
         rho_next = rho_next / jnp.sum(rho_next)
         
-        return rho_next, u, v, error
+        return rho_next, f, g, error
 
-    @jax.jit
     def compute_flow(self, num_steps: int) -> Tuple[Array, Array]:
         """
-        Compute JKO flow trajectory.
+        Compute full JKO flow trajectory over num_steps.
+        
+        Uses lax.scan for efficient computation with warm-starting between steps.
         
         Args:
-            num_steps: Number of JKO steps
+            num_steps: Number of JKO timesteps to compute
             
         Returns:
-            rhos: Trajectory (num_steps+1, n) including rho0
-            errors: Convergence errors at each step (num_steps,)
+            rhos: Full trajectory (num_steps+1, n)
+                - rhos[0] is initial condition rho0
+                - rhos[k] is distribution at time t = k*eta
+            errors: Sinkhorn convergence errors (num_steps,)
+                - errors[k] is error for JKO step k→k+1
+                - Should all be < tol if Sinkhorn converged
+                
+        Example:
+            >>> rhos, errors = jko.compute_flow(100)
+            >>> converged = jnp.all(errors < 1e-9)
+            >>> if converged:
+            ...     print("All Sinkhorn solves converged!")
+            >>> # Analyze flow: entropy, cost, etc.
         """
         n = self.C.shape[0]
 
         def one_step(carry, _):
-            rho_k, u_ws, v_ws = carry
-            rho_next, u_new, v_new, error = self.take_step(rho_k, u_ws, v_ws)
-            next_carry = (rho_next, u_new, v_new)
+            """Execute one JKO step with warm-starting."""
+            rho_k, f_ws, g_ws = carry
+            
+            # Take JKO step with warm start
+            rho_next, f_new, g_new, error = self.take_step(rho_k, f_ws, g_ws)
+            
+            # Prepare next carry
+            next_carry = (rho_next, f_new, g_new)
+            
+            # Output this step's results
             out = (rho_next, error)
+            
             return next_carry, out
 
-        init_carry = (self.rho0, jnp.ones(n), jnp.ones(n))
+        # Initialize with zeros for log-potentials
+        init_carry = (self.rho0, jnp.zeros(n), jnp.zeros(n))
+        
+        # Scan over all JKO steps
         _, outs = lax.scan(one_step, init_carry, xs=None, length=num_steps)
         rhos_steps, errors = outs
         
-        # Prepend initial rho0
+        # Prepend initial condition
         rhos = jnp.concatenate([self.rho0[None, :], rhos_steps], axis=0)
         
         return rhos, errors
