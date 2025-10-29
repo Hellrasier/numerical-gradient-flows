@@ -50,7 +50,7 @@ def _marginal_error(pi: Array, a: Array, b: Array) -> float:
     return jnp.maximum(error_a, error_b)
 
 
-# -------------------- Two-marginal Sinkhorn --------------------
+# -------------------- Sinkhorn Algorithm --------------------
 
 @flstr.dataclass
 class Sinkhorn:
@@ -169,119 +169,6 @@ class Sinkhorn:
         error = _marginal_error(pi_final, self.a, self.b)
         
         return pi_final, u_final, v_final, error
-
-
-# -------------------- Multi-marginal Sinkhorn --------------------
-
-def _einsum_marginal(P: Array, K: Array, axis: int, N: int) -> Array:
-    """Compute a marginal of P by summing over all axes except 'axis'."""
-    axes_to_sum = [i for i in range(N) if i != axis]
-    return jnp.sum(P, axis=tuple(axes_to_sum))
-
-
-@flstr.dataclass
-class MultiMarginalSinkhorn:
-    """
-    Sinkhorn algorithm for multi-marginal entropy-regularized optimal transport.
-    
-    Solves:
-        min_{pi >= 0}  <C, pi> + epsilon * H(pi)
-        s.t.  marginal_i(pi) = mu_i  for all i
-    
-    Attributes:
-        C: Cost tensor (n, n, ..., n) with N dimensions
-        marginals: List of N marginal distributions, each (n,)
-        epsilon: Entropy regularization parameter
-        max_iters: Maximum number of Sinkhorn iterations
-        tol: Convergence tolerance
-    """
-    C: Array  # (n, n, ..., n)
-    marginals: List[Array]  # List of N arrays of shape (n,)
-    epsilon: float
-    max_iters: int = flstr.field(pytree_node=False, default=1000)
-    tol: float = flstr.field(pytree_node=False, default=1e-9)
-
-    def __post_init__(self):
-        """Precompute the Gibbs kernel."""
-        object.__setattr__(self, '_K', _compute_kernel(self.C, self.epsilon))
-        object.__setattr__(self, '_N', len(self.marginals))
-        object.__setattr__(self, '_n', self.marginals[0].shape[0])
-
-    @jax.jit
-    def solve(self, scaling_init: Optional[List[Array]] = None) -> Tuple[Array, List[Array], float, int]:
-        """
-        Solve the multi-marginal entropy-regularized OT problem.
-        
-        Args:
-            scaling_init: Initial scaling variables (list of N arrays of shape (n,))
-            
-        Returns:
-            P: Optimal coupling (n, n, ..., n)
-            scalings: Final scaling variables (list of N arrays)
-            error: Final marginal constraint violation
-            iterations: Number of iterations performed
-        """
-        N = self._N
-        n = self._n
-        K = self._K
-        
-        # Initialize scaling variables
-        if scaling_init is None:
-            scalings = [jnp.ones(n) for _ in range(N)]
-        else:
-            scalings = scaling_init
-
-        def body_fn(carry):
-            scales_c, _, _ = carry
-            scales_new = list(scales_c)
-            
-            # Cyclic updates
-            for i in range(N):
-                # Compute P with current scalings
-                P = K
-                for j in range(N):
-                    if j != i:
-                        shape = [1] * N
-                        shape[j] = n
-                        P = P * scales_new[j].reshape(shape)
-                
-                # Update scaling variable i
-                marginal_i = _einsum_marginal(P, K, i, N)
-                scales_new[i] = self.marginals[i] / (marginal_i + 1e-300)
-            
-            # Compute final P and error
-            P_final = K
-            for j in range(N):
-                shape = [1] * N
-                shape[j] = n
-                P_final = P_final * scales_new[j].reshape(shape)
-            
-            # Compute maximum marginal error
-            error = 0.0
-            for i in range(N):
-                marginal_i = _einsum_marginal(P_final, K, i, N)
-                error_i = jnp.abs(marginal_i - self.marginals[i]).sum()
-                error = jnp.maximum(error, error_i)
-            
-            return (scales_new, error, 1)
-
-        def cond_fn(carry):
-            _, error, iteration = carry
-            return (error > self.tol) & (iteration < self.max_iters)
-
-        init_carry = (scalings, jnp.inf, 0)
-        scales_final, error_final, iters = lax.while_loop(
-            cond_fn, body_fn, init_carry
-        )
-        
-        # Compute final coupling
-        P_final = K
-        for j in range(N):
-            shape = [1] * N
-            shape[j] = n
-            P_final = P_final * scales_final[j].reshape(shape)
-        
-        return P_final, scales_final, error_final, iters
 
 
 # -------------------- Sinkhorn for JKO steps --------------------

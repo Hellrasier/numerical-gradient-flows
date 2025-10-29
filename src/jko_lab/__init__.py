@@ -1,4 +1,5 @@
 from .pdhg_jko import PrimalDualJKO, pdhg_jko, jko_flow, proxF_entropy, proxF_quadratic
+from .sinkhorn_jko import Sinkhorn, SinkhornJKO
 
 __all__ = [
     "PrimalDualJKO",
@@ -7,7 +8,6 @@ __all__ = [
     "pdhg_jko",
     "jko_flow",
     "Sinkhorn",
-    "MultiMarginalSinkhorn",
     "SinkhornJKO",
 ]
 
