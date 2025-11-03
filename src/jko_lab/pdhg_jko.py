@@ -157,7 +157,7 @@ def pdhg_jko(
     eta: float,
     proxF: Callable[[Array, float], Array] | Callable[..., Array],
     proxF_kwargs: Optional[Dict[str, Any]] = None,
-    # F_value: Optional[Callable[[Array], Array]] = None,
+    F_value: Optional[Callable[[Array], Array]] = None,
     num_iters: int = 1_000,
     tau: Optional[float] = None,
     sigma: Optional[float] = None,

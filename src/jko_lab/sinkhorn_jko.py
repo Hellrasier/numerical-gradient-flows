@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 import optax
+import time
 from jax.scipy.special import logsumexp
 import numpy as np
 import matplotlib.pyplot as plt
@@ -28,123 +29,45 @@ HEATMAP_CMAP = 'YlOrRd'
 TRANSPORT_CMAP = 'Blues'
 
 
-def _compute_jko_functional_value(
-    sigma: Array,
-    rho_k: Array,
-    C: Array,
-    epsilon: float,
-    tau: float,
-    V: Optional[Array] = None,
-    sinkhorn_iters: int = 500,
-    sinkhorn_tol: float = 1e-9
-) -> float:
-    """
-    Compute JKO functional G(σ) = F(softmax(σ)) + (1/2τ) * W²(softmax(σ), ρ_k).
-    
-    This is the objective function we minimize using gradient descent.
-    The softmax parametrization ensures ρ = softmax(σ) stays on the probability simplex.
-    
-    Args:
-        sigma: Unconstrained parameters (n,)
-        rho_k: Fixed previous distribution (n,)
-        C: Cost matrix (n, n)
-        epsilon: Sinkhorn regularization
-        tau: JKO time step
-        V: Potential function for F(ρ) = <V, ρ> (optional)
-        sinkhorn_iters: Maximum iterations for Sinkhorn solver
-        sinkhorn_tol: Convergence tolerance for Sinkhorn
-        
-    Returns:
-        G(σ): Scalar functional value to be minimized
-    """
-    # Map unconstrained σ to probability simplex via softmax
-    rho = jax.nn.softmax(sigma)
-    
-    # Functional term: F(ρ) = <V, ρ>
-    F_value = 0.0 if V is None else jnp.sum(V * rho)
-    
-    # Wasserstein distance term using Sinkhorn class as black box
-    W_squared = _compute_wasserstein_squared_from_sinkhorn(
-        rho, rho_k, C, epsilon, sinkhorn_iters, sinkhorn_tol
-    )
-    
-    # JKO functional: F(ρ) + (1/2τ) * W²(ρ, ρ_k)
-    return F_value + W_squared / (2.0 * tau)
+"""
+Sinkhorn-based JKO scheme with proper warm-starting across JKO steps
+
+Key improvements:
+1. Proper warm-starting of dual potentials across JKO steps
+2. Diagnostic mode to track Sinkhorn convergence
+3. Adaptive Sinkhorn iterations based on warm-start quality
+4. Memory-efficient implementation
+"""
+
+# ==================== Sinkhorn Utilities ====================
 
 def _sinkhorn_log_step(f: Array, g: Array, C: Array, a: Array, b: Array, 
                        epsilon: float) -> Tuple[Array, Array]:
-    """
-    Take a single step of log-sum-exp version of Sinkhorn iterations. The updates are given by:
-
-        f = ε·log(a) - ε·logsumexp((g_j - C_ij)/ε, over j)
-        g = ε·log(b) - ε·logsumexp((f_i - C_ij)/ε, over i)
-    
-    Args:
-        f: Log-potential for rows (n,)
-        g: Log-potential for columns (m,)
-        C: Cost matrix (n, m)
-        a: Source marginal (n,)
-        b: Target marginal (m,)
-        epsilon: Regularization parameter
-        
-    Returns:
-        f_new: Updated log-potential for rows (n,)
-        g_new: Updated log-potential for columns (m,)
-    """
-    f_new = epsilon * jnp.log(a) - epsilon * logsumexp(
+    """Single Sinkhorn iteration in log-stabilized form."""
+    f_new = epsilon * jnp.log(a + 1e-300) - epsilon * logsumexp(
         (g[None, :] - C) / epsilon, axis=1
     )
-    g_new = epsilon * jnp.log(b) - epsilon * logsumexp(
+    g_new = epsilon * jnp.log(b + 1e-300) - epsilon * logsumexp(
         (f_new[:, None] - C) / epsilon, axis=0
     )
-    
     return f_new, g_new
 
 
 def _compute_coupling_from_log(f: Array, g: Array, C: Array, epsilon: float) -> Array:
-    """
-    Recover the optimal transport coupling π from log-potentials f and g using:
-
-        π_ij = u_i * K_ij * v_j
-             = exp(log(u_i) + log(K_ij) + log(v_j))
-             = exp((f_i + g_j - C_ij) / ε)
-    
-    where f = ε·log(u), g = ε·log(v), and K = exp(-C/ε).
-    
-    Args:
-        f: Log-potential for rows (n,)
-        g: Log-potential for columns (m,)
-        C: Cost matrix (n, m)
-        epsilon: Regularization parameter
-        
-    Returns:
-        pi: Transport coupling (n, m) - satisfies π≥0, row sums=a, col sums=b
-    """
+    """Recover coupling from log-potentials."""
     return jnp.exp((f[:, None] + g[None, :] - C) / epsilon)
 
 
 def row_sums(pi: Array) -> Array:
-    """Compute row sums of coupling matrix: π @ 1."""
     return pi.sum(axis=1)
 
 
 def col_sums(pi: Array) -> Array:
-    """Compute column sums of coupling matrix: π.T @ 1."""
     return pi.sum(axis=0)
 
 
 def marginal_error(pi: Array, a: Array, b: Array) -> float:
-    """
-    Compute maximum of errors on marginals.
-    
-    Args:
-        pi: Transport coupling (n, m)
-        a: Source marginal (n,)
-        b: Target marginal (m,)
-        
-    Returns:
-        error: max(||π@1 - a||_∞, ||π.T@1 - b||_∞)
-    """
+    """Compute marginal constraint violation (infinity norm)."""
     error_a = jnp.abs(row_sums(pi) - a).max()
     error_b = jnp.abs(col_sums(pi) - b).max()
     return jnp.maximum(error_a, error_b)
@@ -153,136 +76,224 @@ def marginal_error(pi: Array, a: Array, b: Array) -> float:
 @flstr.dataclass
 class Sinkhorn:
     """
-    Log-sum-exp formulation of Sinkhorn solver for entropy-regularized optimal transport.
-    
-    Solves the discrete OT problem:
-        min_{π≥0}  ⟨C, π⟩ + ε·H(π)
-        subject to: π @ 1 = a,  π.T @ 1 = b
-    
-    where H(π) = Σᵢⱼ πᵢⱼ(log(πᵢⱼ) - 1) is Shannon entropy.
-
-    Attributes:
-        C: Cost matrix (n, m)
-        a: Source marginal (n,)
-        b: Target marginal (m,)
-        f: Log-potential for rows (n,)
-        g: Log-potential for columns (m,)
-        epsilon: Regularization parameter
-        max_iters: Maximum number of iterations
-        tol: Convergence tolerance for pushforward errors
+    Sinkhorn solver with adaptive iterations based on warm-start quality.
     """
-    C: Array  # (n, m) cost matrix
-    a: Array  # (n,) source marginal
-    b: Array  # (m,) target marginal
-    epsilon: float  # entropic regularization parameter
+    C: Array
+    a: Array
+    b: Array
+    epsilon: float
     max_iters: int = flstr.field(pytree_node=False, default=1000)
     tol: float = flstr.field(pytree_node=False, default=1e-9)
-    f: Optional[Array] = flstr.field(pytree_node=False, default=None)  # (n,) log-potential for rows
-    g: Optional[Array] = flstr.field(pytree_node=False, default=None)  # (m,) log-potential for cols
-
-    @jax.jit
+    
     def solve(self, 
               f_init: Optional[Array] = None,
               g_init: Optional[Array] = None) -> Tuple[Array, Array, Array, float, int]:
         """
-        Solve entropy-regularized OT using log-sum-exp formulation of Sinkhorn iterations.
-        
-        Args:
-            f_init: Initial log-potential for rows (n,). If None, starts with zeros.
-            g_init: Initial log-potential for cols (m,). If None, starts with zeros.
-            
-        Returns:
-            pi: Optimal transport coupling (n, m)
-            f: Final log-potential for rows (n,)
-            g: Final log-potential for columns (m,)
-            error: Final marginal constraint violation
-            iters: Number of iterations performed
+        Solve with adaptive early stopping.
+        Returns: (pi, f, g, error, iterations)
         """
         n, m = self.C.shape
         
-        # Initialize log-potentials
         f = jnp.zeros(n) if f_init is None else f_init
         g = jnp.zeros(m) if g_init is None else g_init
-
+        
+        # Check initial error for diagnostics
+        pi_init = _compute_coupling_from_log(f, g, self.C, self.epsilon)
+        error_init = marginal_error(pi_init, self.a, self.b)
+        
         def body_fn(carry):
-            """Single iteration: update f, g and check error."""
             f_c, g_c, _, iteration = carry
-            
-            # Perform single Sinkhorn step on log potentials f and g
             f_new, g_new = _sinkhorn_log_step(
                 f_c, g_c, self.C, self.a, self.b, self.epsilon
             )
-            
-            # Compute marginal error
             pi = _compute_coupling_from_log(f_new, g_new, self.C, self.epsilon)
-            error = _marginal_error(pi, self.a, self.b)
-            
+            error = marginal_error(pi, self.a, self.b)
             return (f_new, g_new, error, iteration + 1)
-
+        
         def cond_fn(carry):
-            """Continue while error > tol and not exceeded max_iters."""
             _, _, error, iteration = carry
             return (error > self.tol) & (iteration < self.max_iters)
-
-        # Run Sinkhorn iterations with early stopping
-        init_carry = (f, g, jnp.inf, 0)
+        
+        init_carry = (f, g, error_init, 0)
         f_final, g_final, error_final, iters = lax.while_loop(
             cond_fn, body_fn, init_carry
         )
         
-        # Compute final coupling from converged log-potentials
         pi_final = _compute_coupling_from_log(f_final, g_final, self.C, self.epsilon)
-        
         return pi_final, f_final, g_final, error_final, iters
 
-    @jax.jit
-    def solve_fixed_iters(self,
-                          num_iters: int,
-                          f_init: Optional[Array] = None,
-                          g_init: Optional[Array] = None) -> Tuple[Array, Array, Array, float]:
-        """
-        Solve with exactly num_iters iterations
-        
-        Args:
-            num_iters: Exact number of iterations to perform
-            f_init: Initial log-potential for rows (n,), default zeros
-            g_init: Initial log-potential for columns (m,), default zeros
-            
-        Returns:
-            pi: Transport coupling (n, m)
-            f: Final log-potential for rows (n,)
-            g: Final log-potential for columns (m,)
-            error: Final marginal constraint violation
-            
-        Note:
-            Unlike solve(), this method does NOT return iteration count
-            since it always performs exactly num_iters iterations.
-        """
-        n, m = self.C.shape
-        
-        # Initialize log-potentials
-        f = jnp.zeros(n) if f_init is None else f_init
-        g = jnp.zeros(m) if g_init is None else g_init
 
-        def body_fn(_, carry):
-            """Single iteration: just update f and g."""
-            f_c, g_c = carry
-            f_new, g_new = _sinkhorn_log_step(
-                f_c, g_c, self.C, self.a, self.b, self.epsilon
+# ==================== JKO Solver ====================
+
+@flstr.dataclass
+class SinkhornJKO:
+    """
+    JKO scheme with gradient descent and proper warm-starting.
+    
+    Minimizes: ρ^{k+1} = argmin { F[ρ] + (1/2τ) W²(ρ, ρ^k) }
+    
+    Key feature: Carries dual potentials (f, g) across JKO steps for fast Sinkhorn convergence.
+    """
+    C: Array
+    rho0: Array
+    eta: float  # JKO time step (tau in formulation)
+    epsilon: float
+    F_func: Optional[Callable[[Array], float]] = flstr.field(
+        pytree_node=False, default=None
+    )
+    inner_steps: int = flstr.field(pytree_node=False, default=20)
+    sinkhorn_iters: int = flstr.field(pytree_node=False, default=500)
+    tol: float = flstr.field(pytree_node=False, default=1e-9)
+    learning_rate: float = flstr.field(pytree_node=False, default=0.01)
+    optimizer_name: str = flstr.field(pytree_node=False, default='sgd')
+    verbose: bool = flstr.field(pytree_node=False, default=False)
+    
+    def compute_W2_gradient(
+        self,
+        rho: Array,
+        rho_k: Array,
+        f_ws: Optional[Array] = None,
+        g_ws: Optional[Array] = None
+    ) -> Tuple[Array, Array, Array, int]:
+        """
+        Compute ∇W² using Sinkhorn dual potentials.
+        
+        Returns: (gradient, f_new, g_new, sinkhorn_iters)
+        """
+        solver = Sinkhorn(
+            C=self.C,
+            a=rho,
+            b=rho_k,
+            epsilon=self.epsilon,
+            max_iters=self.sinkhorn_iters,
+            tol=self.tol
+        )
+        
+        _, f_new, g_new, error, iters = solver.solve(f_init=f_ws, g_init=g_ws)
+        grad_W2 = 2.0 * f_new
+        
+        return grad_W2, f_new, g_new, iters
+    
+    def take_step(
+        self,
+        rho_k: Array,
+        f_ws: Optional[Array] = None,
+        g_ws: Optional[Array] = None
+    ) -> Tuple[Array, Array, Array, dict]:
+        """
+        Take one JKO step with diagnostic info.
+        
+        Returns: (rho_next, f_final, g_final, diagnostics)
+        """
+        n = len(rho_k)
+        
+        # Initialize from previous distribution
+        sigma_init = jnp.log(rho_k + 1e-10)
+        
+        # Setup optimizer
+        if self.optimizer_name == 'adam':
+            optimizer = optax.adam(learning_rate=self.learning_rate)
+        elif self.optimizer_name == 'sgd':
+            optimizer = optax.sgd(learning_rate=self.learning_rate)
+        elif self.optimizer_name == 'rmsprop':
+            optimizer = optax.rmsprop(learning_rate=self.learning_rate)
+        else:
+            raise ValueError(f"Unknown optimizer: {self.optimizer_name}")
+        
+        opt_state = optimizer.init(sigma_init)
+        
+        # Initialize potentials (warm-start)
+        f_current = jnp.zeros(n) if f_ws is None else f_ws
+        g_current = jnp.zeros(n) if g_ws is None else g_ws
+        
+        # Gradient function for F
+        if self.F_func is not None:
+            grad_F_fn = jax.grad(self.F_func)
+        else:
+            grad_F_fn = lambda rho: jnp.zeros_like(rho)
+        
+        # Track Sinkhorn iterations for diagnostics
+        total_sinkhorn_iters = jnp.array(0)
+        
+        def sgd_step(state, _):
+            sigma, opt_s, f_pot, g_pot, sink_count = state
+            rho = jax.nn.softmax(sigma)
+            
+            # Gradient computation
+            grad_F_rho = grad_F_fn(rho)
+            grad_W2_rho, f_new, g_new, sink_iters = self.compute_W2_gradient(
+                rho, rho_k, f_pot, g_pot
             )
-            pi = _compute_coupling_from_log(f_new, g_new, self.C, self.epsilon)
-            error = _marginal_error(pi, self.a, self.b)
-            return (f_new, g_new)
-
-        # Run fixed number of iterations
-        f_final, g_final = lax.fori_loop(0, num_iters, body_fn, (f, g))
+            
+            # Combined gradient in rho-space
+            grad_rho = grad_F_rho + grad_W2_rho / (2.0 * self.eta)
+            
+            # Convert to sigma-space via Jacobian of softmax
+            grad_dot_rho = jnp.sum(grad_rho * rho)
+            grad_sigma = rho * (grad_rho - grad_dot_rho)
+            
+            # Update
+            updates, opt_s_new = optimizer.update(grad_sigma, opt_s)
+            sigma_new = optax.apply_updates(sigma, updates)
+            
+            new_state = (sigma_new, opt_s_new, f_new, g_new, sink_count + sink_iters)
+            return new_state, sink_iters  # ← Output per-step Sinkhorn iters
         
-        # Compute final coupling and error
-        pi_final = _compute_coupling_from_log(f_final, g_final, self.C, self.epsilon)
-        error = _marginal_error(pi_final, self.a, self.b)
+        # Run gradient descent
+        init_state = (sigma_init, opt_state, f_current, g_current, total_sinkhorn_iters)
+        final_state, sinkhorn_iters_per_step = lax.scan(
+            sgd_step, init_state, xs=None, length=self.inner_steps
+        )
         
-        return pi_final, f_final, g_final, error
-
+        sigma_final, _, f_final, g_final, total_sink_iters = final_state
+        rho_next = jax.nn.softmax(sigma_final)
+        
+        # Diagnostics (keep as JAX arrays for JIT compatibility)
+        diagnostics = {
+            'total_sinkhorn_iters': total_sink_iters,
+            'avg_sinkhorn_iters': jnp.mean(sinkhorn_iters_per_step),
+            'first_sinkhorn_iters': sinkhorn_iters_per_step[0],
+            'last_sinkhorn_iters': sinkhorn_iters_per_step[-1]
+        }
+        
+        return rho_next, f_final, g_final, diagnostics
+    
+    def compute_flow(self, num_steps: int) -> Tuple[Array, dict]:
+        """
+        Compute JKO flow with warm-starting across steps.
+        
+        Returns: (rhos, diagnostics)
+        """
+        n = self.C.shape[0]
+        
+        def one_step(carry, step_idx):
+            rho_k, f_ws, g_ws = carry
+            
+            # Take JKO step with warm-start
+            rho_next, f_new, g_new, diag = self.take_step(rho_k, f_ws, g_ws)
+            
+            next_carry = (rho_next, f_new, g_new)
+            out = (rho_next, diag['total_sinkhorn_iters'])
+            
+            return next_carry, out
+        
+        # Initialize with zero potentials for first step
+        init_carry = (self.rho0, jnp.zeros(n), jnp.zeros(n))
+        
+        # Scan over JKO steps
+        _, outs = lax.scan(one_step, init_carry, xs=jnp.arange(num_steps))
+        rhos_steps, sinkhorn_iters_per_jko = outs
+        
+        # Prepend initial condition
+        rhos = jnp.concatenate([self.rho0[None, :], rhos_steps], axis=0)
+        
+        diagnostics = {
+            'sinkhorn_iters_per_jko_step': sinkhorn_iters_per_jko,
+            'total_sinkhorn_iters': jnp.sum(sinkhorn_iters_per_jko),
+            'avg_sinkhorn_per_jko': jnp.mean(sinkhorn_iters_per_jko)
+        }
+        
+        return rhos, diagnostics
 
 def plot_marginal(
     marginal: Array,
@@ -670,193 +681,3 @@ def plot_sinkhorn_summary(
     plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
     plt.tight_layout()
     return fig
-
-
-@flstr.dataclass
-class SinkhornJKO:
-    """
-    JKO scheme using entropy-regularized OT with gradient descent.
-    
-    Key insight: Gradient of W² is just the dual potential f from Sinkhorn!
-    No need to autodiff through Sinkhorn - only autodiff the functional F.
-    """
-    C: Array  # (n, n) cost matrix
-    rho0: Array  # (n,) initial distribution
-    eta: float  # JKO timestep (this is tau in the formulation)
-    epsilon: float  # Sinkhorn regularization
-    F_func: Optional[Callable[[Array], float]] = flstr.field(
-        pytree_node=False, default=None
-    )  # Functional F: rho -> scalar (JAX will autodiff ONLY this)
-    inner_steps: int = flstr.field(pytree_node=False, default=50)
-    sinkhorn_iters: int = flstr.field(pytree_node=False, default=500)
-    tol: float = flstr.field(pytree_node=False, default=1e-9)
-    learning_rate: float = flstr.field(pytree_node=False, default=0.01)
-    optimizer_name: str = flstr.field(pytree_node=False, default='adam')
-    
-    def compute_W2_gradient(
-        self, 
-        rho: Array, 
-        rho_k: Array,
-        f_ws: Optional[Array] = None,
-        g_ws: Optional[Array] = None
-    ) -> Tuple[Array, Array, Array]:
-        """
-        Compute gradient of W²_{2,ε}(ρ, ρ_k) w.r.t. ρ using dual potentials.
-        
-        Key insight: ∇_ρ W²(ρ, ρ_k) = 2f (the first dual potential!)
-        
-        Args:
-            rho: Source distribution (n,)
-            rho_k: Target distribution (n,)
-            f_ws: Warm-start for first potential (n,)
-            g_ws: Warm-start for second potential (n,)
-            
-        Returns:
-            grad_W2: Gradient 2f (n,)
-            f_new: Updated first potential (for next warm-start)
-            g_new: Updated second potential (for next warm-start)
-        """
-        # Create Sinkhorn solver
-        solver = Sinkhorn(
-            C=self.C,
-            a=rho,
-            b=rho_k,
-            epsilon=self.epsilon,
-            max_iters=self.sinkhorn_iters,
-            tol=self.tol
-        )
-        
-        # Solve Sinkhorn with warm-start (can use regular solve, no autodiff needed!)
-        _, f_new, g_new, error, iters = solver.solve(f_init=f_ws, g_init=g_ws)
-        
-        # The gradient of W²(ρ, ρ_k) w.r.t. ρ is simply 2f!
-        grad_W2 = 2.0 * f_new
-        
-        return grad_W2, f_new, g_new
-    
-    def take_step(
-        self, 
-        rho_k: Array,
-        f_ws: Optional[Array] = None,
-        g_ws: Optional[Array] = None
-    ) -> Tuple[Array, Array, Array]:
-        """
-        Take one JKO step from rho_k using gradient descent.
-        
-        Gradient computation:
-        - F part: Use JAX autodiff
-        - W² part: Use dual potential f from Sinkhorn (no autodiff needed!)
-        
-        Args:
-            rho_k: Current distribution (n,)
-            f_ws: Warm-start for first potential
-            g_ws: Warm-start for second potential
-            
-        Returns:
-            rho_next: Next distribution (n,)
-            f_final: Final first potential
-            g_final: Final second potential
-        """
-        n = len(rho_k)
-        
-        # Initialize sigma in log-space
-        sigma_init = jnp.log(rho_k + 1e-10)
-        
-        # Create optimizer
-        if self.optimizer_name == 'adam':
-            optimizer = optax.adam(learning_rate=self.learning_rate)
-        elif self.optimizer_name == 'sgd':
-            optimizer = optax.sgd(learning_rate=self.learning_rate)
-        elif self.optimizer_name == 'rmsprop':
-            optimizer = optax.rmsprop(learning_rate=self.learning_rate)
-        else:
-            raise ValueError(f"Unknown optimizer: {self.optimizer_name}")
-        
-        opt_state = optimizer.init(sigma_init)
-        
-        # Initialize warm-start potentials
-        f_current = jnp.zeros(n) if f_ws is None else f_ws
-        g_current = jnp.zeros(n) if g_ws is None else g_ws
-        
-        # Gradient function for F part only (autodiff only this!)
-        if self.F_func is not None:
-            grad_F_fn = jax.grad(self.F_func)
-        else:
-            grad_F_fn = lambda rho: jnp.zeros_like(rho)
-        
-        # Gradient descent loop
-        def sgd_step(state, _):
-            """Single gradient descent step."""
-            sigma, opt_s, f_pot, g_pot = state
-            
-            # Convert to probability distribution
-            rho = jax.nn.softmax(sigma)
-            
-            # --- Gradient computation ---
-            
-            # 1. Gradient of F(ρ) w.r.t. ρ (via autodiff)
-            grad_F_rho = grad_F_fn(rho)
-            
-            # 2. Gradient of W²(ρ, ρ_k) w.r.t. ρ (via dual potential - NO autodiff!)
-            grad_W2_rho, f_new, g_new = self.compute_W2_gradient(rho, rho_k, f_pot, g_pot)
-            
-            # 3. Combine gradients in ρ-space
-            grad_rho = grad_F_rho + grad_W2_rho / (2.0 * self.eta)
-            
-            # 4. Convert to σ-space via Jacobian of softmax
-            # ∇_σ g(softmax(σ)) = softmax(σ) ⊙ (∇_ρ g - <∇_ρ g, softmax(σ)>)
-            grad_dot_rho = jnp.sum(grad_rho * rho)
-            grad_sigma = rho * (grad_rho - grad_dot_rho)
-            
-            # --- Update parameters ---
-            updates, opt_s_new = optimizer.update(grad_sigma, opt_s)
-            sigma_new = optax.apply_updates(sigma, updates)
-            
-            new_state = (sigma_new, opt_s_new, f_new, g_new)
-            return new_state, None
-        
-        # Run gradient descent using scan
-        init_state = (sigma_init, opt_state, f_current, g_current)
-        final_state, _ = lax.scan(sgd_step, init_state, xs=None, length=self.inner_steps)
-        sigma_final, _, f_final, g_final = final_state
-        
-        # Extract final distribution via softmax
-        rho_next = jax.nn.softmax(sigma_final)
-        
-        return rho_next, f_final, g_final
-    
-    def compute_flow(self, num_steps: int) -> Array:
-        """
-        Compute full JKO flow trajectory with warm-starting.
-        
-        Args:
-            num_steps: Number of JKO timesteps to compute
-            
-        Returns:
-            rhos: Full trajectory (num_steps+1, n) including rho0
-        """
-        n = self.C.shape[0]
-        
-        def one_step(carry, _):
-            """Execute one JKO step with warm-starting."""
-            rho_k, f_ws, g_ws = carry
-            
-            # Take JKO step with warm-start
-            rho_next, f_new, g_new = self.take_step(rho_k, f_ws, g_ws)
-            
-            # Prepare next carry and output
-            next_carry = (rho_next, f_new, g_new)
-            out = rho_next
-            
-            return next_carry, out
-        
-        # Initialize with rho0 and zero potentials
-        init_carry = (self.rho0, jnp.zeros(n), jnp.zeros(n))
-        
-        # Scan over all JKO steps with warm-starting
-        _, rhos_steps = lax.scan(one_step, init_carry, xs=None, length=num_steps)
-        
-        # Prepend initial condition
-        rhos = jnp.concatenate([self.rho0[None, :], rhos_steps], axis=0)
-        
-        return rhos
