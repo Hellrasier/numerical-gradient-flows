@@ -131,6 +131,7 @@ def sinkhorn_log(r0, C, X, v_vals, l, tau, b0, u, v, reg=1e-10, iters=100, alpha
 
         return (i + 1, r2, new_b, u, v, K, K_T, new_done)
 
+
     def cond_fun(carry):
         i, _, _, _, _, _, _, done = carry
         return (i < iters) & (~done)
