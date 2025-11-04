@@ -9,24 +9,16 @@ where H(pi) = sum_{i,j} pi_{i,j} (log(pi_{i,j}) - 1) is the Shannon entropy of p
 """
 
 from __future__ import annotations
-from typing import Callable, Optional, Tuple, List
+from functools import partial
+from typing import Callable, Optional, Tuple
 import flax.struct as flstr
 import jax
 import jax.numpy as jnp
 from jax import lax
 import optax
-import time
 from jax.scipy.special import logsumexp
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
-from matplotlib.gridspec import GridSpec
 
 Array = jnp.ndarray
-COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
-          '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
-HEATMAP_CMAP = 'YlOrRd'
-TRANSPORT_CMAP = 'Blues'
 
 
 """
@@ -130,7 +122,7 @@ class SinkhornJKO:
     """
     JKO scheme with gradient descent and proper warm-starting.
     
-    Minimizes: ρ^{k+1} = argmin { F[ρ] + (1/2τ) W²(ρ, ρ^k) }
+    Minimizes: Ï^{k+1} = argmin { F[Ï] + (1/2Ï„) WÂ²(Ï, Ï^k) }
     
     Key feature: Carries dual potentials (f, g) across JKO steps for fast Sinkhorn convergence.
     """
@@ -156,7 +148,7 @@ class SinkhornJKO:
         g_ws: Optional[Array] = None
     ) -> Tuple[Array, Array, Array, int]:
         """
-        Compute ∇W² using Sinkhorn dual potentials.
+        Compute âˆ‡WÂ² using Sinkhorn dual potentials.
         
         Returns: (gradient, f_new, g_new, sinkhorn_iters)
         """
@@ -195,8 +187,6 @@ class SinkhornJKO:
             optimizer = optax.adam(learning_rate=self.learning_rate)
         elif self.optimizer_name == 'sgd':
             optimizer = optax.sgd(learning_rate=self.learning_rate)
-        elif self.optimizer_name == 'rmsprop':
-            optimizer = optax.rmsprop(learning_rate=self.learning_rate)
         else:
             raise ValueError(f"Unknown optimizer: {self.optimizer_name}")
         
@@ -212,7 +202,7 @@ class SinkhornJKO:
         else:
             grad_F_fn = lambda rho: jnp.zeros_like(rho)
         
-        # Track Sinkhorn iterations for diagnostics
+        # Track Sinkhorn iterations for single JKO step
         total_sinkhorn_iters = jnp.array(0)
         
         def sgd_step(state, _):
@@ -241,443 +231,68 @@ class SinkhornJKO:
         
         # Run gradient descent
         init_state = (sigma_init, opt_state, f_current, g_current, total_sinkhorn_iters)
-        final_state, sinkhorn_iters_per_step = lax.scan(
+        final_state, total_sink_iters = lax.scan(
             sgd_step, init_state, xs=None, length=self.inner_steps
         )
         
         sigma_final, _, f_final, g_final, total_sink_iters = final_state
         rho_next = jax.nn.softmax(sigma_final)
         
-        # Diagnostics (keep as JAX arrays for JIT compatibility)
-        diagnostics = {
-            'total_sinkhorn_iters': total_sink_iters,
-            'avg_sinkhorn_iters': jnp.mean(sinkhorn_iters_per_step),
-            'first_sinkhorn_iters': sinkhorn_iters_per_step[0],
-            'last_sinkhorn_iters': sinkhorn_iters_per_step[-1]
-        }
-        
-        return rho_next, f_final, g_final, diagnostics
+        return rho_next, f_final, g_final, total_sink_iters
     
-    def compute_flow(self, num_steps: int) -> Tuple[Array, dict]:
+    @partial(jax.jit, static_argnames=['num_steps'])
+    def compute_flow(self,
+                     num_steps: int,
+                     f_init: Optional[Array] = None,
+                     g_init: Optional[Array] = None,
+        ) -> Tuple[Array, dict]:
         """
-        Compute JKO flow with warm-starting across steps.
+        Compute JKO flow trajectory
         
-        Returns: (rhos, diagnostics)
+        Args:
+            num_steps: Number of JKO steps
+            f_init: Initial f potential for warm-starting (optional)
+            g_init: Initial g potential for warm-starting (optional)
+            
+        Returns:
+            rhos: Trajectory (num_steps+1, n) including rho0
+            diagnostics:
+                - sinkhorn_iters_per_jko_step: number of sinkhorn iterations used in a single JKO step
+                - f_final: Final f potential
+                - g_final: Final g potential
         """
         n = self.C.shape[0]
-        
-        def one_step(carry, step_idx):
-            rho_k, f_ws, g_ws = carry
-            
-            # Take JKO step with warm-start
-            rho_next, f_new, g_new, diag = self.take_step(rho_k, f_ws, g_ws)
-            
-            next_carry = (rho_next, f_new, g_new)
-            out = (rho_next, diag['total_sinkhorn_iters'])
-            
+
+        def one_step(carry, _):
+            rho_k, u_ws, v_ws = carry
+            rho_next, u_new, v_new, sinkhorn_iters_per_JKO = self.take_step(rho_k, u_ws, v_ws)
+            next_carry = (rho_next, u_new, v_new)
+            # Return diagnostics as-is for collection
+            out = (rho_next, sinkhorn_iters_per_JKO)
             return next_carry, out
+
+        # Initialize with provided potentials or default to zeros
+        u = jnp.zeros(n) if f_init is None else f_init
+        v = jnp.zeros(n) if g_init is None else g_init
+        init_carry = (self.rho0, u, v)
         
-        # Initialize with zero potentials for first step
-        init_carry = (self.rho0, jnp.zeros(n), jnp.zeros(n))
+        # Scan over JKO steps - CAPTURE final_carry!
+        final_carry, outs = lax.scan(one_step, init_carry, xs=None, length=num_steps)
+        rhos_steps, sinkhorn_iters_per_JKO = outs
         
-        # Scan over JKO steps
-        _, outs = lax.scan(one_step, init_carry, xs=jnp.arange(num_steps))
-        rhos_steps, sinkhorn_iters_per_jko = outs
+        # Extract final potentials from carry
+        _, u_final, v_final = final_carry
         
-        # Prepend initial condition
+        # Prepend initial rho0
         rhos = jnp.concatenate([self.rho0[None, :], rhos_steps], axis=0)
         
+        
+        # Return diagnostics including final potentials
         diagnostics = {
-            'sinkhorn_iters_per_jko_step': sinkhorn_iters_per_jko,
-            'total_sinkhorn_iters': jnp.sum(sinkhorn_iters_per_jko),
-            'avg_sinkhorn_per_jko': jnp.mean(sinkhorn_iters_per_jko)
+            # 'sinkhorn_iters_per_jko_step': step_diagnostics,
+            'sinkhorn_iters_per_jko_step': sinkhorn_iters_per_JKO,
+            'f_final': u_final,  # Return final f potential
+            'g_final': v_final   # Return final g potential
         }
         
         return rhos, diagnostics
-
-def plot_marginal(
-    marginal: Array,
-    x: Optional[Array] = None,
-    label: Optional[str] = None,
-    ax: Optional[plt.Axes] = None,
-    color: Optional[str] = None,
-    **kwargs
-) -> plt.Axes:
-    """
-    Plot a single probability vector (marginal distribution).
-    
-    Args:
-        marginal: Probability vector (n,)
-        x: Domain points (n,). If None, uses indices 0, 1, ..., n-1
-        label: Label for the plot legend
-        ax: Matplotlib axes. If None, creates new figure
-        color: Line color. If None, uses default color cycle
-        **kwargs: Additional arguments passed to plt.plot
-        
-    Returns:
-        Matplotlib axes object
-    """
-    marginal = np.asarray(marginal)
-    
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 4))
-    
-    if x is None:
-        x = np.arange(len(marginal))
-    else:
-        x = np.asarray(x)
-    
-    # Plot
-    plot_kwargs = {'linewidth': 2, 'alpha': 0.8}
-    plot_kwargs.update(kwargs)
-    
-    if color is not None:
-        plot_kwargs['color'] = color
-    
-    ax.plot(x, marginal, label=label, **plot_kwargs)
-    ax.fill_between(x, marginal, alpha=0.3, color=plot_kwargs.get('color', None))
-    
-    ax.set_xlabel('x', fontsize=11)
-    ax.set_ylabel('Probability density', fontsize=11)
-    ax.grid(True, alpha=0.3, linestyle='--')
-    
-    if label is not None:
-        ax.legend(fontsize=10)
-    
-    ax.set_ylim(bottom=0)
-    
-    return ax
-
-
-def plot_marginals(
-    marginals: List[Array],
-    x: Optional[Array] = None,
-    labels: Optional[List[str]] = None,
-    title: Optional[str] = None,
-    figsize: Tuple[int, int] = (10, 5),
-    colors: Optional[List[str]] = None
-) -> plt.Figure:
-    """
-    Plot multiple marginal distributions on the same axes.
-    
-    Args:
-        marginals: List of probability vectors
-        x: Domain points. If None, uses indices
-        labels: List of labels for each marginal
-        title: Plot title
-        figsize: Figure size (width, height)
-        colors: List of colors for each marginal
-        
-    Returns:
-        Matplotlib figure object
-    """
-    fig, ax = plt.subplots(figsize=figsize)
-    
-    if labels is None:
-        labels = [f'Marginal {i+1}' for i in range(len(marginals))]
-    
-    if colors is None:
-        colors = COLORS[:len(marginals)]
-    
-    for i, (marginal, label, color) in enumerate(zip(marginals, labels, colors)):
-        plot_marginal(marginal, x=x, label=label, ax=ax, color=color)
-    
-    if title is not None:
-        ax.set_title(title, fontsize=13, fontweight='bold')
-    
-    ax.legend(fontsize=11)
-    plt.tight_layout()
-    
-    return fig
-
-
-def plot_cost_matrix(
-    C: Array,
-    title: str = 'Cost Matrix',
-    figsize: Tuple[int, int] = (8, 7),
-    cmap: str = HEATMAP_CMAP,
-    log_scale: bool = False,
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None,
-    show_colorbar: bool = True
-) -> plt.Figure:
-    """
-    Visualize a cost matrix as a heatmap.
-    
-    Args:
-        C: Cost matrix (n, m)
-        title: Plot title
-        figsize: Figure size (width, height)
-        cmap: Colormap name
-        log_scale: If True, use logarithmic color scale
-        vmin: Minimum value for color scale
-        vmax: Maximum value for color scale
-        show_colorbar: Whether to show colorbar
-        
-    Returns:
-        Matplotlib figure object
-    """
-    C = np.asarray(C)
-    
-    fig, ax = plt.subplots(figsize=figsize)
-    
-    # Determine color scale
-    norm = LogNorm(vmin=vmin, vmax=vmax) if log_scale else None
-    
-    im = ax.imshow(
-        C,
-        cmap=cmap,
-        aspect='auto',
-        interpolation='nearest',
-        origin='lower',
-        norm=norm,
-        vmin=vmin,
-        vmax=vmax
-    )
-    
-    ax.set_xlabel('Target index', fontsize=11)
-    ax.set_ylabel('Source index', fontsize=11)
-    ax.set_title(title, fontsize=13, fontweight='bold', pad=15)
-    
-    if show_colorbar:
-        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label('Cost', fontsize=11)
-    
-    plt.tight_layout()
-    
-    return fig
-
-
-def plot_transport_plan(
-    pi: Array,
-    a: Optional[Array] = None,
-    b: Optional[Array] = None,
-    x_source: Optional[Array] = None,
-    x_target: Optional[Array] = None,
-    title: str = 'Optimal Transport Plan',
-    figsize: Tuple[int, int] = (10, 10),
-    cmap: str = TRANSPORT_CMAP,
-    show_marginals: bool = True,
-    log_scale: bool = False
-) -> plt.Figure:
-    """
-    Plot optimal transport plan with marginals on the sides.
-    
-    Creates a figure with the transport plan in the center and
-    marginal distributions on the top and right sides.
-    
-    Args:
-        pi: Transport plan matrix (n, m)
-        a: Source marginal (n,). If None, computed from pi
-        b: Target marginal (m,). If None, computed from pi
-        x_source: Source domain points (n,)
-        x_target: Target domain points (m,)
-        title: Main plot title
-        figsize: Figure size (width, height)
-        cmap: Colormap for transport plan
-        show_marginals: Whether to show marginal plots
-        log_scale: If True, use log scale for transport plan colors
-        
-    Returns:
-        Matplotlib figure object
-    """
-    pi = np.asarray(pi)
-    
-    if a is None:
-        a = pi.sum(axis=1)
-    else:
-        a = np.asarray(a)
-    
-    if b is None:
-        b = pi.sum(axis=0)
-    else:
-        b = np.asarray(b)
-    
-    n, m = pi.shape
-    
-    if x_source is None:
-        x_source = np.arange(n)
-    else:
-        x_source = np.asarray(x_source)
-    
-    if x_target is None:
-        x_target = np.arange(m)
-    else:
-        x_target = np.asarray(x_target)
-    
-    # Create figure with GridSpec
-    fig = plt.figure(figsize=figsize)
-    
-    if show_marginals:
-        gs = GridSpec(3, 3, figure=fig, 
-                     width_ratios=[1, 4, 0.2],
-                     height_ratios=[1, 4, 0.2],
-                     hspace=0.05, wspace=0.05)
-        
-        ax_main = fig.add_subplot(gs[1, 1])
-        ax_top = fig.add_subplot(gs[0, 1], sharex=ax_main)
-        ax_right = fig.add_subplot(gs[1, 0], sharey=ax_main)
-        ax_cbar = fig.add_subplot(gs[1, 2])
-    else:
-        gs = GridSpec(1, 2, figure=fig,
-                     width_ratios=[10, 0.5],
-                     wspace=0.05)
-        ax_main = fig.add_subplot(gs[0, 0])
-        ax_cbar = fig.add_subplot(gs[0, 1])
-    
-    # Plot main transport plan
-    norm = LogNorm(vmin=pi[pi > 0].min(), vmax=pi.max()) if log_scale and pi.max() > 0 else None
-    
-    extent = [x_target.min(), x_target.max(), x_source.min(), x_source.max()]
-    im = ax_main.imshow(
-        pi,
-        cmap=cmap,
-        aspect='auto',
-        interpolation='nearest',
-        origin='lower',
-        extent=extent,
-        norm=norm
-    )
-    
-    ax_main.set_xlabel('Target (x)', fontsize=11)
-    ax_main.set_ylabel('Source (y)', fontsize=11)
-    ax_main.set_title(title, fontsize=13, fontweight='bold', pad=15)
-    
-    # Colorbar
-    cbar = plt.colorbar(im, cax=ax_cbar)
-    cbar.set_label('Transport mass', fontsize=11)
-    
-    if show_marginals:
-        # Plot marginals
-        # Top: target marginal b
-        ax_top.plot(x_target, b, color=COLORS[1], linewidth=2, label='Target')
-        ax_top.fill_between(x_target, b, alpha=0.3, color=COLORS[1])
-        ax_top.set_ylabel('Target\nmarginal', fontsize=10)
-        ax_top.set_ylim(bottom=0)
-        ax_top.grid(True, alpha=0.3, linestyle='--')
-        ax_top.tick_params(labelbottom=False)
-        
-        # Right: source marginal a (rotated)
-        ax_right.plot(a, x_source, color=COLORS[0], linewidth=2, label='Source')
-        ax_right.fill_betweenx(x_source, a, alpha=0.3, color=COLORS[0])
-        ax_right.set_xlabel('Source\nmarginal', fontsize=10)
-        ax_right.set_xlim(left=0)
-        ax_right.grid(True, alpha=0.3, linestyle='--')
-        ax_right.tick_params(labelleft=False)
-        ax_right.invert_xaxis()
-    
-    return fig
-
-def plot_convergence(
-    errors: Array,
-    title: str = 'Convergence History',
-    figsize: Tuple[int, int] = (10, 5),
-    log_scale: bool = True,
-    threshold: Optional[float] = None
-) -> plt.Figure:
-    """
-    Plot convergence of error metrics over iterations.
-    
-    Args:
-        errors: Array of error values (num_iters,)
-        title: Plot title
-        figsize: Figure size
-        log_scale: Whether to use log scale for y-axis
-        threshold: Optional horizontal line showing convergence threshold
-        
-    Returns:
-        Matplotlib figure object
-        
-    Example:
-        >>> _, errors = solver.compute_flow(num_steps=100)
-        >>> plot_convergence(errors, threshold=1e-8)
-    """
-    errors = np.asarray(errors)
-    
-    fig, ax = plt.subplots(figsize=figsize)
-    
-    iterations = np.arange(len(errors))
-    ax.plot(iterations, errors, linewidth=2, color=COLORS[0], marker='o', 
-            markersize=4, markevery=max(1, len(errors) // 20))
-    
-    if log_scale:
-        ax.set_yscale('log')
-    
-    if threshold is not None:
-        ax.axhline(y=threshold, color='r', linestyle='--', linewidth=2, 
-                  label=f'Threshold = {threshold:.2e}')
-        ax.legend(fontsize=10)
-    
-    ax.set_xlabel('Iteration', fontsize=11)
-    ax.set_ylabel('Error', fontsize=11)
-    ax.set_title(title, fontsize=13, fontweight='bold')
-    ax.grid(True, alpha=0.3, linestyle='--')
-    
-    plt.tight_layout()
-    
-    return fig
-
-
-def plot_sinkhorn_summary(
-    C: Array,
-    a: Array,
-    b: Array,
-    pi: Array,
-    x_source: Optional[Array] = None,
-    x_target: Optional[Array] = None,
-    figsize: Tuple[int, int] = (16, 5)
-) -> plt.Figure:
-    """
-    Create a comprehensive summary plot for Sinkhorn algorithm.
-    
-    Shows: marginals, cost matrix, and the corresponding optimal transport plan.
-    
-    Args:
-        C: Cost matrix (n, m)
-        a: Source marginal (n,)
-        b: Target marginal (m,)
-        pi: Optimal transport plan (n, m)
-        x_source: Source domain points
-        x_target: Target domain points
-        figsize: Figure size
-        
-    Returns:
-        Matplotlib figure object
-    """
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
-    
-    a = np.asarray(a)
-    b = np.asarray(b)
-    n, m = len(a), len(b)
-    if x_source is None:
-        x_source = np.arange(n)
-    if x_target is None:
-        x_target = np.arange(m)
-    axes[0].plot(x_source, a, color=COLORS[0], linewidth=2, label='Source (a)')
-    axes[0].fill_between(x_source, a, alpha=0.3, color=COLORS[0])
-    axes[0].plot(x_target, b, color=COLORS[1], linewidth=2, label='Target (b)')
-    axes[0].fill_between(x_target, b, alpha=0.3, color=COLORS[1])
-    axes[0].set_xlabel('x', fontsize=11)
-    axes[0].set_ylabel('Density', fontsize=11)
-    axes[0].set_title('Marginals', fontsize=12, fontweight='bold')
-    axes[0].legend(fontsize=10)
-    axes[0].grid(True, alpha=0.3, linestyle='--')
-    axes[0].set_ylim(bottom=0)
-    
-    C = np.asarray(C)
-    im1 = axes[1].imshow(C, cmap=HEATMAP_CMAP, aspect='auto', 
-                         interpolation='nearest', origin='lower')
-    axes[1].set_xlabel('Y', fontsize=11)
-    axes[1].set_ylabel('X', fontsize=11)
-    axes[1].set_title('Cost Matrix C', fontsize=12, fontweight='bold')
-    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-    
-    pi = np.asarray(pi)
-    im2 = axes[2].imshow(pi, cmap=TRANSPORT_CMAP, aspect='auto',
-                         interpolation='nearest', origin='lower')
-    axes[2].set_xlabel('Y', fontsize=11)
-    axes[2].set_ylabel('X', fontsize=11)
-    axes[2].set_title('Optimal Transport Plan', fontsize=12, fontweight='bold')
-    plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
-    plt.tight_layout()
-    return fig
