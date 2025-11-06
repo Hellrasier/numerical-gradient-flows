@@ -21,16 +21,6 @@ from jax.scipy.special import logsumexp
 Array = jnp.ndarray
 
 
-"""
-Sinkhorn-based JKO scheme with proper warm-starting across JKO steps
-
-Key improvements:
-1. Proper warm-starting of dual potentials across JKO steps
-2. Diagnostic mode to track Sinkhorn convergence
-3. Adaptive Sinkhorn iterations based on warm-start quality
-4. Memory-efficient implementation
-"""
-
 # ==================== Sinkhorn Utilities ====================
 
 def _sinkhorn_log_step(f: Array, g: Array, C: Array, a: Array, b: Array, 
@@ -64,11 +54,10 @@ def marginal_error(pi: Array, a: Array, b: Array) -> float:
     error_b = jnp.abs(col_sums(pi) - b).max()
     return jnp.maximum(error_a, error_b)
 
-
 @flstr.dataclass
 class Sinkhorn:
     """
-    Sinkhorn solver with adaptive iterations based on warm-start quality.
+    Sinkhorn solver
     """
     C: Array
     a: Array
@@ -120,15 +109,13 @@ class Sinkhorn:
 @flstr.dataclass
 class SinkhornJKO:
     """
-    JKO scheme with gradient descent and proper warm-starting.
+    JKO scheme with gradient descent
     
-    Minimizes: Ï^{k+1} = argmin { F[Ï] + (1/2Ï„) WÂ²(Ï, Ï^k) }
-    
-    Key feature: Carries dual potentials (f, g) across JKO steps for fast Sinkhorn convergence.
+    Minimizes: ρ^{k+1} = argmin { F[ρ] + (1/2τ) W²(ρ, ρ^k) }
     """
     C: Array
     rho0: Array
-    eta: float  # JKO time step (tau in formulation)
+    eta: float
     epsilon: float
     F_func: Optional[Callable[[Array], float]] = flstr.field(
         pytree_node=False, default=None
@@ -148,9 +135,9 @@ class SinkhornJKO:
         g_ws: Optional[Array] = None
     ) -> Tuple[Array, Array, Array, int]:
         """
-        Compute âˆ‡WÂ² using Sinkhorn dual potentials.
+        Compute ∇W² using Sinkhorn dual potentials.
         
-        Returns: (gradient, f_new, g_new, sinkhorn_iters)
+        Returns: (f_new, g_new, sinkhorn_iters)
         """
         solver = Sinkhorn(
             C=self.C,
@@ -162,23 +149,22 @@ class SinkhornJKO:
         )
         
         _, f_new, g_new, error, iters = solver.solve(f_init=f_ws, g_init=g_ws)
-        grad_W2 = 2.0 * f_new
         
-        return grad_W2, f_new, g_new, iters
+        return f_new, g_new, error, iters
     
     def take_step(
         self,
         rho_k: Array,
         f_ws: Optional[Array] = None,
         g_ws: Optional[Array] = None
-    ) -> Tuple[Array, Array, Array, dict]:
+    ) -> Tuple[Array, Array, Array, Array, Array]:  # Changed return type
         """
-        Take one JKO step with diagnostic info.
+        Take one JKO step
         
-        Returns: (rho_next, f_final, g_final, diagnostics)
+        Returns: (rho_next, f_final, g_final, sinkhorn_iters)
         """
         n = len(rho_k)
-        
+
         # Initialize from previous distribution
         sigma_init = jnp.log(rho_k + 1e-10)
         
@@ -192,7 +178,7 @@ class SinkhornJKO:
         
         opt_state = optimizer.init(sigma_init)
         
-        # Initialize potentials (warm-start)
+        # Initialize potentials with warm start
         f_current = jnp.zeros(n) if f_ws is None else f_ws
         g_current = jnp.zeros(n) if g_ws is None else g_ws
         
@@ -202,49 +188,49 @@ class SinkhornJKO:
         else:
             grad_F_fn = lambda rho: jnp.zeros_like(rho)
         
-        # Track Sinkhorn iterations for single JKO step
         total_sinkhorn_iters = jnp.array(0)
         
         def sgd_step(state, _):
             sigma, opt_s, f_pot, g_pot, sink_count = state
+
             rho = jax.nn.softmax(sigma)
-            
-            # Gradient computation
+        
             grad_F_rho = grad_F_fn(rho)
-            grad_W2_rho, f_new, g_new, sink_iters = self.compute_W2_gradient(
+            f_new, g_new, _, sink_iters = self.compute_W2_gradient(
                 rho, rho_k, f_pot, g_pot
             )
-            
-            # Combined gradient in rho-space
-            grad_rho = grad_F_rho + grad_W2_rho / (2.0 * self.eta)
-            
+
+            # make sure that the gradient of W2 is in the tangent space of simplex
+            grad_W2_rho = (f_new - jnp.mean(f_new)) / self.eta
+            grad_rho = grad_F_rho + grad_W2_rho # total gradient of the combined function
+
             # Convert to sigma-space via Jacobian of softmax
             grad_dot_rho = jnp.sum(grad_rho * rho)
             grad_sigma = rho * (grad_rho - grad_dot_rho)
             
-            # Update
+            # Apply gradient update with tangent gradient
             updates, opt_s_new = optimizer.update(grad_sigma, opt_s)
             sigma_new = optax.apply_updates(sigma, updates)
             
             new_state = (sigma_new, opt_s_new, f_new, g_new, sink_count + sink_iters)
-            return new_state, sink_iters  # ← Output per-step Sinkhorn iters
-        
-        # Run gradient descent
+            return new_state, sink_iters
+
+        # Run PSGD
         init_state = (sigma_init, opt_state, f_current, g_current, total_sinkhorn_iters)
         final_state, total_sink_iters = lax.scan(
             sgd_step, init_state, xs=None, length=self.inner_steps
         )
         
-        sigma_final, _, f_final, g_final, total_sink_iters = final_state
+        sigma_final, _, f_final, g_final, _ = final_state
         rho_next = jax.nn.softmax(sigma_final)
-        
+
         return rho_next, f_final, g_final, total_sink_iters
-    
+
     @partial(jax.jit, static_argnames=['num_steps'])
     def compute_flow(self,
-                     num_steps: int,
-                     f_init: Optional[Array] = None,
-                     g_init: Optional[Array] = None,
+                    num_steps: int,
+                    f_init: Optional[Array] = None,
+                    g_init: Optional[Array] = None,
         ) -> Tuple[Array, dict]:
         """
         Compute JKO flow trajectory
@@ -257,7 +243,7 @@ class SinkhornJKO:
         Returns:
             rhos: Trajectory (num_steps+1, n) including rho0
             diagnostics:
-                - sinkhorn_iters_per_jko_step: number of sinkhorn iterations used in a single JKO step
+                - sinkhorn_iters_per_jko_step: sinkhorn iterations per JKO step
                 - f_final: Final f potential
                 - g_final: Final g potential
         """
@@ -265,10 +251,9 @@ class SinkhornJKO:
 
         def one_step(carry, _):
             rho_k, u_ws, v_ws = carry
-            rho_next, u_new, v_new, sinkhorn_iters_per_JKO = self.take_step(rho_k, u_ws, v_ws)
+            rho_next, u_new, v_new, sinkhorn_iters = self.take_step(rho_k, u_ws, v_ws)
             next_carry = (rho_next, u_new, v_new)
-            # Return diagnostics as-is for collection
-            out = (rho_next, sinkhorn_iters_per_JKO)
+            out = (rho_next, sinkhorn_iters)
             return next_carry, out
 
         # Initialize with provided potentials or default to zeros
@@ -276,7 +261,7 @@ class SinkhornJKO:
         v = jnp.zeros(n) if g_init is None else g_init
         init_carry = (self.rho0, u, v)
         
-        # Scan over JKO steps - CAPTURE final_carry!
+        # Scan over JKO steps
         final_carry, outs = lax.scan(one_step, init_carry, xs=None, length=num_steps)
         rhos_steps, sinkhorn_iters_per_JKO = outs
         
@@ -286,13 +271,11 @@ class SinkhornJKO:
         # Prepend initial rho0
         rhos = jnp.concatenate([self.rho0[None, :], rhos_steps], axis=0)
         
-        
         # Return diagnostics including final potentials
         diagnostics = {
-            # 'sinkhorn_iters_per_jko_step': step_diagnostics,
             'sinkhorn_iters_per_jko_step': sinkhorn_iters_per_JKO,
-            'f_final': u_final,  # Return final f potential
-            'g_final': v_final   # Return final g potential
+            'f_final': u_final,
+            'g_final': v_final
         }
         
         return rhos, diagnostics
